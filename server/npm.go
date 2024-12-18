@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -38,16 +38,6 @@ type Package struct {
 	PkgPrNew bool
 	Name     string
 	Version  string
-}
-
-func (p *Package) FullName() string {
-	if p.Github {
-		return "gh/" + p.Name
-	}
-	if p.PkgPrNew {
-		return "pr/" + p.Name
-	}
-	return p.Name
 }
 
 func (p *Package) String() string {
@@ -325,9 +315,9 @@ func NewNpmRcFromJSON(jsonData []byte) (npmrc *NpmRC, err error) {
 
 func (rc *NpmRC) StoreDir() string {
 	if rc.zoneId != "" {
-		return path.Join(config.WorkDir, "npm-"+rc.zoneId)
+		return filepath.Join(config.WorkDir, "npm-"+rc.zoneId)
 	}
-	return path.Join(config.WorkDir, "npm")
+	return filepath.Join(config.WorkDir, "npm")
 }
 
 func (rc *NpmRC) getPackageInfo(name string, semver string) (info *PackageJSON, err error) {
@@ -349,7 +339,7 @@ func (rc *NpmRC) getPackageInfo(name string, semver string) (info *PackageJSON, 
 	// check if the package has been installed
 	if regexpVersionStrict.MatchString(semver) {
 		var raw PackageJSONRaw
-		pkgJsonPath := path.Join(rc.StoreDir(), name+"@"+semver, "node_modules", name, "package.json")
+		pkgJsonPath := filepath.Join(rc.StoreDir(), name+"@"+semver, "node_modules", name, "package.json")
 		if existsFile(pkgJsonPath) && utils.ParseJSONFile(pkgJsonPath, &raw) == nil {
 			info = raw.ToNpmPackage()
 			return
@@ -510,8 +500,8 @@ func (npmrc *NpmRC) fetchPackageInfo(packageName string, semverOrDistTag string)
 }
 
 func (rc *NpmRC) installPackage(pkg Package) (packageJson *PackageJSON, err error) {
-	installDir := path.Join(rc.StoreDir(), pkg.String())
-	packageJsonPath := path.Join(installDir, "node_modules", pkg.Name, "package.json")
+	installDir := filepath.Join(rc.StoreDir(), pkg.String())
+	packageJsonPath := filepath.Join(installDir, "node_modules", pkg.Name, "package.json")
 
 	// check if the package has been installed
 	if existsFile(packageJsonPath) {
@@ -523,8 +513,8 @@ func (rc *NpmRC) installPackage(pkg Package) (packageJson *PackageJSON, err erro
 	}
 
 	// only one installation process is allowed at the same time for the same package
-	v, _ := installLocks.LoadOrStore(pkg.FullName(), &sync.Mutex{})
-	defer installLocks.Delete(pkg.FullName())
+	v, _ := installLocks.LoadOrStore(pkg.String(), &sync.Mutex{})
+	defer installLocks.Delete(pkg.String())
 
 	v.(*sync.Mutex).Lock()
 	defer v.(*sync.Mutex).Unlock()
@@ -560,7 +550,7 @@ func (rc *NpmRC) installPackage(pkg Package) (packageJson *PackageJSON, err erro
 			return nil, err
 		}
 		if info.Deprecated != "" {
-			os.WriteFile(path.Join(installDir, "deprecated.txt"), []byte(info.Deprecated), 0644)
+			os.WriteFile(filepath.Join(installDir, "deprecated.txt"), []byte(info.Deprecated), 0644)
 		}
 		err = rc.downloadTarball(rc.getRegistryByPackageName(pkg.Name), installDir, info.Name, info.Dist.Tarball)
 	}
@@ -577,6 +567,71 @@ func (rc *NpmRC) installPackage(pkg Package) (packageJson *PackageJSON, err erro
 
 	packageJson = raw.ToNpmPackage()
 	return
+}
+
+func (rc *NpmRC) installDependencies(wd string, pkgJson *PackageJSON, npmMode bool, mark *StringSet) {
+	wg := sync.WaitGroup{}
+	dependencies := map[string]string{}
+	for name, version := range pkgJson.Dependencies {
+		dependencies[name] = version
+	}
+	// install peer dependencies as well in _npm_ mode
+	if npmMode {
+		for name, version := range pkgJson.PeerDependencies {
+			dependencies[name] = version
+		}
+	}
+	if mark == nil {
+		mark = NewStringSet()
+	}
+	for name, version := range dependencies {
+		wg.Add(1)
+		go func(name, version string) {
+			defer wg.Done()
+			pkg := Package{Name: name, Version: version}
+			p, err := resolveDependencyVersion(version)
+			if err != nil {
+				return
+			}
+			if p.Name != "" {
+				pkg = p
+			}
+			if strings.HasSuffix(pkg.Name, "@types/") {
+				// skip installing `@types/*` packages
+				return
+			}
+			if !regexpVersionStrict.MatchString(pkg.Version) && !pkg.Github && !pkg.PkgPrNew {
+				p, e := rc.fetchPackageInfo(pkg.Name, pkg.Version)
+				if e != nil {
+					return
+				}
+				pkg.Version = p.Version
+			}
+			markId := fmt.Sprintf("%s@%s:%s:%v", pkgJson.Name, pkgJson.Version, pkg.String(), npmMode)
+			if mark.Has(markId) {
+				return
+			}
+			mark.Add(markId)
+			installed, err := rc.installPackage(pkg)
+			if err != nil {
+				return
+			}
+			// link the installed package to the node_modules directory of current build context
+			linkDir := filepath.Join(wd, "node_modules", name)
+			_, err = os.Lstat(linkDir)
+			if err != nil && os.IsNotExist(err) {
+				if strings.ContainsRune(name, '/') {
+					ensureDir(filepath.Dir(linkDir))
+				}
+				os.Symlink(filepath.Join(rc.StoreDir(), pkg.String(), "node_modules", pkg.Name), linkDir)
+			}
+			// install dependencies recursively
+			if len(installed.Dependencies) > 0 || (len(installed.PeerDependencies) > 0 && npmMode) {
+				rc.installDependencies(wd, installed, npmMode, mark)
+			}
+		}(name, version)
+	}
+	wg.Wait()
 }
 
 func (rc *NpmRC) downloadTarball(reg *NpmRegistry, installDir string, pkgName string, tarballUrl string) (err error) {
@@ -608,13 +663,13 @@ do:
 	defer res.Body.Close()
 
 	if res.StatusCode == 404 || res.StatusCode == 401 {
-		err = fmt.Errorf("tarball of package '%s' not found", path.Base(installDir))
+		err = fmt.Errorf("tarball of package '%s' not found", filepath.Base(installDir))
 		return
 	}
 
 	if res.StatusCode != 200 {
 		msg, _ := io.ReadAll(res.Body)
-		err = fmt.Errorf("could not download tarball of package '%s' (%s: %s)", path.Base(installDir), res.Status, string(msg))
+		err = fmt.Errorf("could not download tarball of package '%s' (%s: %s)", filepath.Base(installDir), res.Status, string(msg))
 		return
 	}
 
@@ -623,8 +678,8 @@ do:
 }
 
 func (npmrc *NpmRC) isDeprecated(pkgName string, pkgVersion string) (string, error) {
-	installDir := path.Join(npmrc.StoreDir(), pkgName+"@"+pkgVersion)
-	data, err := os.ReadFile(path.Join(installDir, "deprecated.txt"))
+	installDir := filepath.Join(npmrc.StoreDir(), pkgName+"@"+pkgVersion)
+	data, err := os.ReadFile(filepath.Join(installDir, "deprecated.txt"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
@@ -799,7 +854,7 @@ func extractPackageTarball(installDir string, packname string, tarball io.Reader
 		return
 	}
 
-	rootDir := path.Join(installDir, "node_modules", packname)
+	rootDir := filepath.Join(installDir, "node_modules", packname)
 	defer func() {
 		if err != nil {
 			// remove the root dir if failed
@@ -817,25 +872,28 @@ func extractPackageTarball(installDir string, packname string, tarball io.Reader
 		if err != nil {
 			return err
 		}
-		// strip tarball root dir
-		_, name := utils.SplitByFirstByte(h.Name, '/')
-		filename := path.Join(rootDir, name)
+		// normalize the filename
+		_, filename := utils.SplitByFirstByte(utils.NormalizePathname(h.Name)[1:], '/')
+		if filename == "" {
+			continue
+		}
+		savepath := filepath.Join(rootDir, filename)
 		if h.Typeflag == tar.TypeDir {
-			ensureDir(filename)
+			ensureDir(savepath)
 			continue
 		}
 		if h.Typeflag != tar.TypeReg {
 			continue
 		}
-		extname := path.Ext(filename)
+		extname := filepath.Ext(savepath)
 		if !(extname != "" && (assetExts[extname[1:]] || contains(moduleExts, extname) || extname == ".map" || extname == ".css" || extname == ".svelte" || extname == ".vue")) {
 			// skip unsupported formats
 			continue
 		}
-		f, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(savepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 		if err != nil && os.IsNotExist(err) {
-			os.MkdirAll(path.Dir(filename), 0755)
-			f, err = os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+			os.MkdirAll(filepath.Dir(savepath), 0755)
+			f, err = os.OpenFile(savepath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 		}
 		if err != nil {
 			return err
